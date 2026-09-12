@@ -1,132 +1,269 @@
+import pandas as pd
+from pathlib import Path
+# Настройки отображения Pandas
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 200)
+
+
 class DataProcessor:
-    def __init__(self, base_path: str = "."):
-        # Преобразуем строку в объект Path
+    """Готовит витрину заказов для анализа лояльности пользователей."""
+
+    PURCHASES_FILE = "afisha_raw.csv"
+    RATES_FILE = "final_tickets_tenge_df.csv"
+
+    CAT_COLS = ["device_type_canonical", "currency_code", "event_type_main",
+                "service_name", "region_name", "city_name"]
+    REQUIRED_COLS = ["user_id", "order_id", "order_dt", "order_ts", "revenue"]
+
+    def __init__(self, base_path=None, revenue_quantile=0.99, verbose=True):
+        # Логика определения пути: если скрипт запущен из src, берем родителя
+        if base_path is None:
+            # __file__ - это путь к этому файлу. .parents[1] - это папка проекта (на 2 уровня выше src)
+            base_path = Path(__file__).resolve().parents[1]
+        
         self.base_path = Path(base_path).resolve()
-        # Папка data должна быть рядом с base_path
         self.data_dir = self.base_path / "data"
-        
-        print(f"📁 Базовый путь: {self.base_path}")
-        print(f"📁 Ищем данные в: {self.data_dir}")
+        self.revenue_quantile = revenue_quantile
+        self.verbose = verbose
 
-    def load_and_process(self) -> pd.DataFrame:
-        """Выполняет загрузку, подготовку курсов и предобработку."""
-        
-        # --- ШАГ 1: Загрузка данных о покупках ---
-        purchases_file = self.data_dir / "afisha_raw.csv"
-        if not purchases_file.exists():
-            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {purchases_file}\n"
-                                    f"Проверьте, лежит ли файл afisha_raw.csv в папке {self.data_dir}")
-        
-        print(f"✅ Загружаем: {purchases_file.name}")
-        df = pd.read_csv(purchases_file)
-        print(f"   Загружено строк: {len(df):,}, колонок: {len(df.columns)}")
+        self.rates = None
+        self.data = None
+        self.stats = {}
 
-        # --- ШАГ 2: Загрузка и подготовка курсов валют ---
-        rates_file = self.data_dir / "final_tickets_tenge_df.csv"
-        if not rates_file.exists():
-            raise FileNotFoundError(f"❌ ФАЙЛ НЕ НАЙДЕН: {rates_file}\n"
-                                    f"Проверьте, лежит ли файл final_tickets_tenge_df.csv в папке {self.data_dir}")
+        self._log(f"Базовый путь:  {self.base_path}")
+        self._log(f"Папка данных:  {self.data_dir}")
 
-        print(f"✅ Загружаем курсы: {rates_file.name}")
-        rates = pd.read_csv(rates_file, parse_dates=['data'])
-        
-        # Расчет курса
-        rates['rate_per_kzt'] = rates['curs'] / rates['nominal']
-        rates = rates[['data', 'rate_per_kzt']].rename(columns={'data': 'order_dt'})
+    def __repr__(self):
+        rows = len(self.data) if self.data is not None else 0
+        return f"DataProcessor(base_path='{self.base_path}', rows={rows:,})"
 
-        # Полный календарь для заполнения пропусков
-        calendar = pd.DataFrame({
-            'order_dt': pd.date_range(start='2024-01-01', end='2024-12-31', freq='D')
-        })
-        
-        rates_full = calendar.merge(rates, on='order_dt', how='left').sort_values('order_dt')
-        rates_full['rate_per_kzt'] = rates_full['rate_per_kzt'].ffill().bfill()
-        
-        na_count = rates_full['rate_per_kzt'].isna().sum()
-        if na_count > 0:
-            print(f"⚠️ Внимание: осталось {na_count} пропусков в курсе валют!")
-        else:
-            print("✅ Курсы валют подготовлены, пропусков нет.")
+    # ------------------------------------------------------------------ load
+    def load_data(self):
+        """Загружает CSV с заказами."""
+        path = self._file(self.PURCHASES_FILE)
+        df = pd.read_csv(path, parse_dates=["order_dt", "order_ts"])
 
-        # --- ШАГ 3: Предобработка (Типы, Конвертация, Чистка) ---
-        
-        # 3.1. Даты
-        df['order_dt'] = pd.to_datetime(df['order_dt']).dt.normalize()
-        if 'order_ts' in df.columns:
-            df['order_ts'] = pd.to_datetime(df['order_ts'])
+        missing = set(self.REQUIRED_COLS) - set(df.columns)
+        if missing:
+            raise ValueError(f"Нет обязательных колонок: {sorted(missing)}")
 
-        # 3.2. Конвертация валюты
-        df = df.merge(rates_full, on='order_dt', how='left')
-        
-        # Нормализация валюты
-        currency = df['currency_code'].str.strip().str.lower()
-        
-        # Конвертация
-        df['revenue_rub'] = df['revenue'].where(
-            currency == 'rub',
-            df['revenue'] * df['rate_per_kzt']
-        ).round(2)
-
-        # 3.3. Оптимизация типов (Downcast)
-        if 'tickets_count' in df.columns:
-            df['tickets_count'] = pd.to_numeric(df['tickets_count'], downcast='integer')
-        if 'days_since_prev' in df.columns:
-            df['days_since_prev'] = df['days_since_prev'].astype('Int16')
-            
-        for col in ['revenue', 'revenue_rub']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], downcast='float')
-
-        # 3.4. Чистка категорий
-        cat_cols = ['device_type_canonical', 'currency_code', 'event_type_main',
-                    'service_name', 'region_name', 'city_name']
-        
-        existing_cat_cols = [c for c in cat_cols if c in df.columns]
-        
-        for col in existing_cat_cols:
-            df[col] = (df[col].astype(str)
-                              .str.strip()
-                              .str.replace(r'\s+', ' ', regex=True)
-                              .astype('category'))
-
-        # 3.5. Удаление выбросов (Top 1%)
-        if 'revenue_rub' in df.columns:
-            p99 = df['revenue_rub'].quantile(0.99)
-            initial_count = len(df)
-            df = df[df['revenue_rub'] <= p99].copy()
-            removed_count = initial_count - len(df)
-            print(f"🗑️ Удалено выбросов (top 1%): {removed_count} строк.")
-
-        print(f"✅ Обработка завершена. Итого строк: {len(df):,}")
+        self._log(f"Заказы загружены: {len(df):,} строк, {df.shape[1]} колонок")
         return df
 
-# --- ТОЧКА ВХОДА ---
+    def load_rates(self):
+        """Загружает курс тенге и строит непрерывный календарь курсов."""
+        path = self._file(self.RATES_FILE)
+        rates = pd.read_csv(path, parse_dates=["data"])
+
+        missing = {"data", "curs", "nominal"} - set(rates.columns)
+        if missing:
+            raise ValueError(f"В файле курсов нет колонок: {sorted(missing)}")
+
+        rates["rate_per_kzt"] = rates["curs"] / rates["nominal"]
+        rates = (rates[["data", "rate_per_kzt"]]
+                 .rename(columns={"data": "order_dt"})
+                 .assign(order_dt=lambda x: x["order_dt"].dt.normalize())
+                 .drop_duplicates(subset="order_dt"))
+
+        calendar = pd.DataFrame(
+            {"order_dt": pd.date_range("2024-01-01", "2024-12-31", freq="D")})
+        rates = (calendar.merge(rates, on="order_dt", how="left")
+                 .sort_values("order_dt"))
+        rates["rate_per_kzt"] = rates["rate_per_kzt"].ffill().bfill()
+
+        if rates["rate_per_kzt"].isna().any():
+            raise ValueError("В календаре курсов остались пропуски.")
+
+        self._log(f"Курсы валют: {len(rates)} дней, пропусков нет")
+        self.rates = rates.reset_index(drop=True)
+        return self.rates
+
+    # ------------------------------------------------------------ preprocess
+    def preprocess(self, df, rates):
+        """Приведение типов, конвертация валют и базовая чистка."""
+        df = df.copy()
+        rows_before = len(df)
+        mem_before = df.memory_usage(deep=True).sum() / 1024 ** 2
+
+        # 1. даты
+        df["order_dt"] = pd.to_datetime(df["order_dt"], errors="coerce").dt.normalize()
+        df["order_ts"] = pd.to_datetime(df["order_ts"], errors="coerce")
+
+        # 2. чистка: дубли, пропуски, аномалии
+        n_dupes = int(df.duplicated().sum())
+        df = df.drop_duplicates().drop_duplicates(subset="order_id")
+
+        n_na = int(df[self.REQUIRED_COLS].isna().any(axis=1).sum())
+        df = df.dropna(subset=self.REQUIRED_COLS)
+
+        n_bad = int(((df["revenue"] <= 0) | (df["tickets_count"] <= 0)).sum())
+        df = df[(df["revenue"] > 0) & (df["tickets_count"] > 0)]
+
+        # 3. конвертация валюты
+        df = df.drop(columns=["rate_per_kzt", "revenue_rub"], errors="ignore")
+        df = df.merge(rates, on="order_dt", how="left")
+
+        currency = df["currency_code"].astype(str).str.strip().str.lower()
+        df["revenue_rub"] = (df["revenue"]
+                             .where(currency == "rub",
+                                    df["revenue"] * df["rate_per_kzt"])
+                             .round(2))
+
+        self.stats["currency_check"] = (
+            df.assign(_cur=currency)
+            .groupby("_cur", observed=True)
+            .agg(orders=("revenue", "size"),
+                 revenue_orig=("revenue", "sum"),
+                 revenue_rub=("revenue_rub", "sum"),
+                 na_rub=("revenue_rub", lambda s: int(s.isna().sum())))
+            .round(2))
+
+        # 4. типы данных
+        df["tickets_count"] = pd.to_numeric(
+            df["tickets_count"], errors="coerce", downcast="integer")
+        
+        if "days_since_prev" in df.columns:
+            df["days_since_prev"] = pd.to_numeric(
+                df["days_since_prev"], errors="coerce").astype("Int16")
+
+        for col in ["revenue", "revenue_rub", "rate_per_kzt"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
+
+        for col in [c for c in self.CAT_COLS if c in df.columns]:
+            df[col] = (df[col].astype(str)
+                       .str.strip()
+                       .str.replace(r"\s+", " ", regex=True)
+                       .astype("category"))
+
+        # 5. выбросы по 99-му перцентилю revenue_rub
+        n_out = 0
+        if self.revenue_quantile is not None:
+            p = df["revenue_rub"].quantile(self.revenue_quantile)
+            n_out = int((df["revenue_rub"] > p).sum())
+            df = df[df["revenue_rub"] <= p]
+            self._log(f"Порог выбросов (p{self.revenue_quantile:.0%}): "
+                      f"{p:.2f} руб., удалено {n_out:,} строк")
+
+        df = df.sort_values(["user_id", "order_ts"]).reset_index(drop=True)
+        mem_after = df.memory_usage(deep=True).sum() / 1024 ** 2
+
+        self.stats.update({
+            "rows_before": rows_before,
+            "rows_after": len(df),
+            "duplicates": n_dupes,
+            "rows_with_na": n_na,
+            "anomalies": n_bad,
+            "outliers": n_out,
+            "users": int(df["user_id"].nunique()),
+            "memory_mb": f"{mem_before:.1f} -> {mem_after:.1f}",
+        })
+
+        self._log(f"Чистка: {rows_before:,} -> {len(df):,} строк "
+                  f"(дубли {n_dupes}, пропуски {n_na}, аномалии {n_bad})")
+        self._log(f"Память: {mem_before:.1f} MB -> {mem_after:.1f} MB")
+        return df
+
+    # -------------------------------------------------------------- pipeline
+    def run(self):
+        """Полный цикл: загрузка заказов и курсов + предобработка."""
+        df = self.load_data()
+        rates = self.load_rates()
+        self.data = self.preprocess(df, rates)
+        self._log("Данные готовы к анализу")
+        return self.data
+
+    def report(self):
+        """Сводка по качеству итоговой витрины."""
+        if self.data is None:
+            raise RuntimeError("Сначала вызовите run().")
+
+        df = self.data
+
+        print("\n--- Итоговая витрина ---")
+        print(f"Заказов:        {len(df):,}")
+        print(f"Пользователей:  {df['user_id'].nunique():,}")
+        print(f"Период:         {df['order_dt'].min().date()} — "
+              f"{df['order_dt'].max().date()}")
+        print(f"Средний чек:    {df['revenue_rub'].mean():.2f} руб.")
+        print(f"Медианный чек:  {df['revenue_rub'].median():.2f} руб.")
+        print(f"Полных дублей:  {df.duplicated().sum()} | "
+              f"дублей order_id: {df['order_id'].duplicated().sum()}")
+
+        # пропуски в days_since_prev должны быть только у первых заказов
+        if "days_since_prev" in df.columns:
+            first_ts = df.groupby("user_id", observed=True)["order_ts"].transform("min")
+            is_first = df["order_ts"] == first_ts
+            na_total = int(df["days_since_prev"].isna().sum())
+            na_first = int((df["days_since_prev"].isna() & is_first).sum())
+            status = "совпадает" if na_total == na_first else "РАСХОЖДЕНИЕ"
+            print(f"days_since_prev: пропусков {na_total:,}, "
+                  f"из них первые заказы {na_first:,} — {status}")
+
+        na = pd.DataFrame({
+            "na_count": df.isna().sum(),
+            "na_pct": (100 * df.isna().mean()).round(2),
+            "dtype": df.dtypes.astype(str),
+        })
+        na = na[na["na_count"] > 0]
+
+        print("\nПропуски по колонкам:")
+        print(na if not na.empty else "нет")
+
+        print("\nПроверка конвертации валют:")
+        print(self.stats.get("currency_check", "нет данных"))
+
+        return na
+
+    def save(self, filename="afisha_processed.csv"):
+        """Сохраняет готовую витрину в папку data/."""
+        if self.data is None:
+            raise RuntimeError("Нет данных: сначала вызовите run().")
+
+        path = self.data_dir / filename
+        self.data.to_csv(path, index=False)
+        self._log(f"Сохранено {len(self.data):,} строк в {path}")
+        return path
+
+    # --------------------------------------------------------------- helpers
+    def _file(self, name):
+        """Возвращает путь к файлу в data/, проверяя его наличие."""
+        path = self.data_dir / name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Файл не найден: {path}\n"
+                f"Проверьте, что '{name}' лежит в папке {self.data_dir}")
+        return path
+
+    def _log(self, message):
+        """Печатает сообщение, если включён режим verbose."""
+        if self.verbose:
+            print(message)
+
+
+# --- ТОЧКА ВХОДА (ИСПРАВЛЕНО) ---
+# Здесь НЕЛЬЗЯ использовать return. Только вызовы функций.
 if __name__ == "__main__":
-    # ВАЖНО: Если ты запускаешь из папки src, используй "..", если из корня - "."
-    # Ниже логика автоматически определяет, откуда запущен скрипт, чтобы найти папку data
-    
-    current_dir = Path(__file__).parent.resolve()
-    
-    # Если скрипт лежит в src, а data лежит в корне проекта, то base_path = ".."
-    # Если скрипт лежит в корне, то base_path = "."
-    # Мы проверяем, есть ли папка data внутри текущей директории. Если нет, идем вверх.
-    
-    if (current_dir / "data").exists():
-        base_path = current_dir
-    else:
-        base_path = current_dir.parent
-        
-    print(f"🔍 Автоматически определен базовый путь: {base_path}")
-    
     try:
-        processor = DataProcessor(base_path=str(base_path))
-        final_df = processor.load_and_process()
+        # Создаем экземпляр класса. Путь определится автоматически (родительская папка)
+        processor = DataProcessor()
         
-        print("\n--- Результат (первые 5 строк) ---")
-        print(final_df.head())
-        print("\n--- Типы данных ---")
-        print(final_df.info())
+        # Запускаем полный пайплайн
+        data = processor.run()
         
+        # Выводим отчет
+        processor.report()
+
+        print("\n--- Первые 5 строк ---")
+        print(data.head())
+        
+        # Опционально: сохранить результат
+        # processor.save("afisha_processed.csv")
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ ОШИБКА ФАЙЛА: {e}")
+        print("\n💡 ПОДСКАЗКА:")
+        print("1. Убедитесь, что файлы лежат в папке: mle-analiz-loyalnosti-polzovatelej/data/")
+        print("2. Проверьте названия файлов: afisha_raw.csv и final_tickets_tenge_df.csv")
     except Exception as e:
-        print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
-        print("\n💡 ПОДСКАЗКА: Убедитесь, что файлы afisha_raw.csv и final_tickets_tenge_df.csv лежат в папке 'data' рядом с проектом.")
+        print(f"\n❌ ПРОИЗОШЛА ОШИБКА: {e}")
