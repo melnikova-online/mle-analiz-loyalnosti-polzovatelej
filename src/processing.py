@@ -1,7 +1,3 @@
-import pandas as pd
-from pathlib import Path
-import os
-
 class DataProcessor:
     def __init__(self, base_path: str = "."):
         # Преобразуем строку в объект Path
